@@ -1,0 +1,1112 @@
+<#
+Disclaimer
+The sample scripts are not supported under any Microsoft standard support program or service.
+The sample scripts are provided AS IS without warranty of any kind. Microsoft further disclaims all implied warranties
+including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+In no event shall Microsoft, its authors, or anyone else involved in the creation, production, or delivery of the scripts
+be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption,
+loss of business information, or other pecuniary loss) arising out of the use of or inability to use the sample scripts or
+documentation, even if Microsoft has been advised of the possibility of such damages.
+#>
+# Simplified-EntraRoleAudit.ps1
+# Version: 1.0
+# Purpose: Audit Microsoft Entra directory role assignments using Microsoft Graph PowerShell.
+# Output: One CSV file containing summary, active role assignments, and optional PIM eligibility rows.
+# Supports interactive delegated sign-in, device code sign-in, or app-only certificate authentication.
+# Delegated auth uses scopes. App-only auth uses application permissions such as RoleManagement.Read.All, Directory.Read.All, User.Read.All, Group.Read.All, and Application.Read.All.
+# Required delegated scopes used by this script: RoleManagement.Read.Directory, Directory.Read.All, User.Read.All, Group.Read.All, Application.Read.All.
+# Optional PIM eligibility reporting requires RoleEligibilitySchedule.Read.Directory and the Microsoft.Graph.Identity.Governance module.
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+    [ValidateSet("Auto","Interactive","DeviceCode","Certificate")]
+    [string]$ConnectionMode = "Auto",
+    [ValidateSet("Prompt","WholeTenant","SpecificGroup","EnabledUsers","OneUser","ServicePrincipals")]
+    [string]$AuditScope = "Prompt",
+    [ValidateSet("Prompt","All","Privileged","Write","Reader","Custom")]
+    [string]$RolePreset = "Prompt",
+    [string]$TargetGroupIdOrName,
+    [string]$TargetUserIdOrUpn,
+    [string]$TenantId,
+    [string]$ClientId,
+    [string]$CertificateThumbprint,
+    [string]$OutputPath = ".\EntraRoleAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
+    [string]$OutputFileName = "EntraRoleAudit.csv",
+    [string[]]$RoleNames = @(
+        "Global Administrator",
+        "Privileged Role Administrator",
+        "Security Administrator",
+        "Security Reader",
+        "Global Reader",
+        "User Administrator",
+        "Application Administrator",
+        "Cloud Application Administrator",
+        "Conditional Access Administrator",
+        "Authentication Administrator",
+        "Privileged Authentication Administrator",
+        "Intune Administrator",
+        "Compliance Administrator"
+    ),
+    [switch]$IncludePIM,
+    [switch]$IncludeGroupMembers,
+    [switch]$AllRoles,
+    [switch]$NonInteractive
+)
+# ============================================================
+# SECTION 1 - CONSOLE OUTPUT HELPERS
+# These functions are intentionally small wrappers around Write-Host and Write-Progress.
+# Keeping them centralized makes it easier to change colors, prefixes, and progress behavior later.
+# ============================================================
+# Console output helper functions keep script messages consistent and readable.
+function Write-Section {
+    param([string]$Text)
+
+    Write-Host ""
+    Write-Host ("=" * 72) -ForegroundColor Cyan
+    Write-Host " $Text" -ForegroundColor Cyan
+    Write-Host ("=" * 72) -ForegroundColor Cyan
+}
+function Write-Step {
+    param([string]$Text)
+
+    Write-Host "  > $Text" -ForegroundColor Yellow
+}
+function Write-Ok {
+    param([string]$Text)
+
+    Write-Host "  [OK] $Text" -ForegroundColor Green
+}
+function Write-Warn2 {
+    param([string]$Text)
+
+    Write-Host "  [WARN] $Text" -ForegroundColor DarkYellow
+}
+function Stop-WithMessage {
+    param([string]$Text)
+
+    Write-Host ""
+    Write-Host "ERROR: $Text" -ForegroundColor Red
+    throw $Text
+}
+function Show-Progress {
+    param(
+        [string]$Activity,
+        [string]$Status,
+        [int]$Current,
+        [int]$Total
+    )
+
+    if ($Total -le 0) {
+        return
+    }
+
+    $percent = [math]::Min(100, [math]::Round(($Current / $Total) * 100, 0))
+
+    $progressParams = @{
+        Activity        = $Activity
+        Status          = $Status
+        PercentComplete = $percent
+    }
+
+    Write-Progress @progressParams
+}
+# ============================================================
+# SECTION 2 - INPUT AND MENU HELPER FUNCTIONS
+# These functions collect operator choices and normalize them into script-scoped variables.
+# Script-scoped variables are used so menu choices persist between menu screens.
+# ============================================================
+# Prompt helper functions are used when parameters are not supplied at launch.
+function Read-InputValue {
+    param(
+        [string]$CurrentValue,
+        [string]$Prompt,
+        [string]$Name
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
+        return $CurrentValue
+    }
+
+    if ($NonInteractive) {
+        Stop-WithMessage "$Name is required when using -NonInteractive."
+    }
+
+    $value = Read-Host $Prompt
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        Stop-WithMessage "$Name is required."
+    }
+
+    return $value
+}
+function Select-ConnectionMode {
+    if ($ConnectionMode -ne "Auto") {
+        return $ConnectionMode
+    }
+
+    if ($NonInteractive) {
+        Stop-WithMessage "ConnectionMode is required when using -NonInteractive. Use -ConnectionMode Certificate with ClientId and CertificateThumbprint, or choose Interactive or DeviceCode without -NonInteractive."
+    }
+
+    Write-Host ""
+    Write-Host "Select Microsoft Graph connection method:" -ForegroundColor Cyan
+    Write-Host "  1. Interactive browser sign-in (delegated)"
+    Write-Host "  2. Device code sign-in (delegated)"
+    Write-Host "  3. App-only certificate authentication"
+
+    $choice = Read-Host "Enter 1, 2, or 3"
+
+    switch ($choice) {
+        "1" { return "Interactive" }
+        "2" { return "DeviceCode" }
+        "3" { return "Certificate" }
+        default { Stop-WithMessage "Invalid connection option selected." }
+    }
+}
+function Read-YesNo {
+    param(
+        [string]$Prompt,
+        [bool]$Default = $false
+    )
+
+    if ($NonInteractive) {
+        return $Default
+    }
+
+    $suffix = if ($Default) { "Y/n" } else { "y/N" }
+
+    while ($true) {
+        $answer = Read-Host "$Prompt [$suffix]"
+
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return $Default
+        }
+
+        switch ($answer.Trim().ToLowerInvariant()) {
+            "y"   { return $true }
+            "yes" { return $true }
+            "n"   { return $false }
+            "no"  { return $false }
+            default { Write-Warn2 "Enter Y or N." }
+        }
+    }
+}
+function Get-RoleNamesForPreset {
+    param(
+        [string]$Preset
+    )
+
+    # Converts a friendly preset name into the exact Entra role display names to audit.
+    switch ($Preset) {
+        "All" {
+            # All means no role-name filter. The audit includes every enabled directory role returned by Graph.
+            $script:AllRoles = $true
+            return @()
+        }
+
+        "Privileged" {
+            # High-impact roles that can administer identity, security, application, and access control configuration.
+            return @(
+                "Global Administrator",
+                "Privileged Role Administrator",
+                "Security Administrator",
+                "Conditional Access Administrator",
+                "Authentication Administrator",
+                "Privileged Authentication Administrator",
+                "Application Administrator",
+                "Cloud Application Administrator",
+                "User Administrator"
+            )
+        }
+
+        "Write" {
+            # Administrative roles with write capability across users, groups, apps, policies, or workloads.
+            return @(
+                "User Administrator",
+                "Groups Administrator",
+                "Application Administrator",
+                "Cloud Application Administrator",
+                "Exchange Administrator",
+                "SharePoint Administrator",
+                "Teams Administrator",
+                "Intune Administrator",
+                "Authentication Administrator",
+                "Conditional Access Administrator",
+                "Compliance Administrator",
+                "Helpdesk Administrator"
+            )
+        }
+
+        "Reader" {
+            # Read-only roles useful for visibility and reporting without configuration rights.
+            return @(
+                "Global Reader",
+                "Security Reader",
+                "Directory Readers",
+                "Reports Reader",
+                "Message Center Reader",
+                "Usage Summary Reports Reader"
+            )
+        }
+
+        "Custom" {
+            # Custom allows the operator to provide exact Entra role display names.
+            if ($NonInteractive -and (-not $RoleNames -or $RoleNames.Count -eq 0)) {
+                Stop-WithMessage "RoleNames is required with -RolePreset Custom and -NonInteractive."
+            }
+
+            $custom = Read-Host "Enter role names separated by commas"
+
+            if ([string]::IsNullOrWhiteSpace($custom)) {
+                return $RoleNames
+            }
+
+            return @(
+                $custom.Split(",") |
+                    ForEach-Object { $_.Trim() } |
+                    Where-Object { $_ }
+            )
+        }
+
+        default {
+            return $RoleNames
+        }
+    }
+}
+function Select-RolePreset {
+    Write-Host ""
+    Write-Host "===== SELECT ROLE PRESET =====" -ForegroundColor Cyan
+    Write-Host "1. All roles"
+    Write-Host "2. Privileged roles"
+    Write-Host "3. Write / admin roles"
+    Write-Host "4. Reader roles"
+    Write-Host "5. Custom role names"
+    Write-Host "B. Back"
+    Write-Host ""
+    Write-Host "Current role filter: $script:RolePreset" -ForegroundColor DarkCyan
+
+    $choice = Read-Host "Select an option"
+
+    switch ($choice.ToUpper()) {
+        "1" { return "All" }
+        "2" { return "Privileged" }
+        "3" { return "Write" }
+        "4" { return "Reader" }
+        "5" { return "Custom" }
+        "B" { return $script:RolePreset }
+        default {
+            Write-Host "Invalid selection." -ForegroundColor Red
+            return $script:RolePreset
+        }
+    }
+}
+function Select-AuditScope {
+    if ($AuditScope -ne "Prompt") {
+        return $AuditScope
+    }
+
+    if ($NonInteractive) {
+        Stop-WithMessage "AuditScope is required when using -NonInteractive."
+    }
+
+    Write-Host ""
+    Write-Host "Select audit scope:" -ForegroundColor Cyan
+    Write-Host "  1. Whole tenant role audit"
+    Write-Host "  2. Specific group"
+    Write-Host "  3. Enabled users only"
+    Write-Host "  4. One user"
+    Write-Host "  5. Service principals only"
+
+    $choice = Read-Host "Enter 1-5"
+
+    switch ($choice) {
+        "1" { return "WholeTenant" }
+        "2" { return "SpecificGroup" }
+        "3" { return "EnabledUsers" }
+        "4" { return "OneUser" }
+        "5" { return "ServicePrincipals" }
+        default { Stop-WithMessage "Invalid audit scope selected." }
+    }
+}
+# ============================================================
+# SECTION 3 - CSV OUTPUT SHAPE HELPERS
+# The CSV intentionally uses one consistent schema for summary, active-role, and PIM rows.
+# Empty values are added for columns that do not apply to a specific row type.
+# ============================================================
+# Output helpers keep the CSV schema consistent across summary, active role, and PIM rows.
+function Add-RecordType {
+    param(
+        [object[]]$Data,
+        [string]$RecordType
+    )
+
+    foreach ($item in @($Data)) {
+        $item | Add-Member -NotePropertyName RecordType -NotePropertyValue $RecordType -Force
+        $item
+    }
+}
+function New-AuditRow {
+    param(
+        [string]$RoleName,
+        [string]$RoleId,
+        [string]$AssignmentType,
+        [object]$Principal,
+        [string]$SourceGroup = "",
+        [object]$Schedule = $null
+    )
+
+    [pscustomobject]@{
+        RoleName             = $RoleName
+        RoleId               = $RoleId
+        AssignmentType       = $AssignmentType
+        PrincipalType        = $Principal.Type
+        DisplayName          = $Principal.DisplayName
+        UserPrincipalName    = $Principal.UPN
+        Mail                 = $Principal.Mail
+        AccountEnabled       = $Principal.AccountEnabled
+        UserType             = $Principal.UserType
+        Department           = $Principal.Department
+        JobTitle             = $Principal.JobTitle
+        PrincipalId          = $Principal.Id
+        AppId                = $Principal.AppId
+        SourceGroup          = $SourceGroup
+        ScheduleStart        = $Schedule.ScheduleStart
+        ScheduleEnd          = $Schedule.ScheduleEnd
+        ExpirationType       = $Schedule.ExpirationType
+        Status               = $Schedule.Status
+        TenantId             = ""
+        ConnectionMode       = ""
+        ClientId             = ""
+        AllRoles             = ""
+        IncludedPIM          = ""
+        IncludedGroupMembers = ""
+        ActiveAssignmentRows = ""
+        PimEligibleRows      = ""
+        OutputFilePath       = ""
+        ExportedAt           = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    }
+}
+function New-EmptySchedule {
+    [pscustomobject]@{
+        ScheduleStart  = ""
+        ScheduleEnd    = ""
+        ExpirationType = ""
+        Status         = ""
+    }
+}
+function New-PimSchedule {
+    param([object]$Item)
+
+    [pscustomobject]@{
+        ScheduleStart  = $Item.ScheduleInfo.StartDateTime
+        ScheduleEnd    = $Item.ScheduleInfo.Expiration.EndDateTime
+        ExpirationType = $Item.ScheduleInfo.Expiration.Type
+        Status         = $Item.Status
+    }
+}
+# ============================================================
+# SECTION 4 - MICROSOFT GRAPH MODULES AND CONNECTION
+# The script does not install Excel modules or require Excel. It only imports Microsoft Graph modules.
+# Connection supports delegated interactive sign-in, device code sign-in, and app-only certificate auth.
+# ============================================================
+# Microsoft Graph module loader validates required modules before connecting.
+function Initialize-GraphModules {
+    # Load only the Microsoft Graph modules required for this audit.
+    # This script does not auto-install modules. If a module is missing, the script tells the operator what to install.
+    $modules = @(
+        "Microsoft.Graph.Authentication",
+        "Microsoft.Graph.Identity.DirectoryManagement",
+        "Microsoft.Graph.Users",
+        "Microsoft.Graph.Groups",
+        "Microsoft.Graph.Applications"
+    )
+
+    if ($script:IncludePIM -or $IncludePIM) {
+        $modules += "Microsoft.Graph.Identity.Governance"
+    }
+
+    $missingModules = @()
+
+    foreach ($module in ($modules | Sort-Object -Unique)) {
+        if (-not (Get-Module -ListAvailable -Name $module)) {
+            $missingModules += $module
+            continue
+        }
+
+        Import-Module $module -Force -ErrorAction Stop
+        Write-Ok "Loaded module: $module"
+    }
+
+    if ($missingModules.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Missing required Microsoft Graph PowerShell module(s):" -ForegroundColor Red
+        foreach ($module in $missingModules) {
+            Write-Host "  $module" -ForegroundColor Yellow
+        }
+
+        Write-Host ""
+        Write-Host "Install the missing module(s), then rerun the script. Example:" -ForegroundColor Cyan
+        Write-Host "  Install-Module Microsoft.Graph -Scope CurrentUser -Repository PSGallery -Force" -ForegroundColor Cyan
+
+        Stop-WithMessage "Required Microsoft Graph module(s) are missing."
+    }
+}
+# Microsoft Graph connection function supports delegated and app-only authentication options.
+function Connect-EntraAuditGraph {
+    $script:ConnectionModeUsed = Select-ConnectionMode
+
+    $scopes = @(
+        "RoleManagement.Read.Directory",
+        "Directory.Read.All",
+        "User.Read.All",
+        "Group.Read.All",
+        "Application.Read.All"
+    )
+
+    if ($script:IncludePIM -or $IncludePIM) {
+        $scopes += "RoleEligibilitySchedule.Read.Directory"
+    }
+
+    Write-Step "Connecting to Microsoft Graph using $script:ConnectionModeUsed mode"
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+
+    switch ($script:ConnectionModeUsed) {
+        "Interactive" {
+            if ([string]::IsNullOrWhiteSpace($TenantId)) {
+                Connect-MgGraph -Scopes $scopes -NoWelcome -ErrorAction Stop
+            }
+            else {
+                Connect-MgGraph -TenantId $TenantId -Scopes $scopes -NoWelcome -ErrorAction Stop
+            }
+        }
+
+        "DeviceCode" {
+            if ([string]::IsNullOrWhiteSpace($TenantId)) {
+                Connect-MgGraph -Scopes $scopes -UseDeviceCode -NoWelcome -ErrorAction Stop
+            }
+            else {
+                Connect-MgGraph -TenantId $TenantId -Scopes $scopes -UseDeviceCode -NoWelcome -ErrorAction Stop
+            }
+        }
+
+        "Certificate" {
+            $script:ClientId = Read-InputValue -CurrentValue $ClientId -Prompt "App registration client ID" -Name "ClientId"
+            $script:CertificateThumbprint = Read-InputValue -CurrentValue $CertificateThumbprint -Prompt "Certificate thumbprint" -Name "CertificateThumbprint"
+
+            if ([string]::IsNullOrWhiteSpace($TenantId)) {
+                Stop-WithMessage "TenantId is required for certificate-based app-only authentication."
+            }
+
+            Connect-MgGraph -TenantId $TenantId -ClientId $script:ClientId -CertificateThumbprint $script:CertificateThumbprint -NoWelcome -ErrorAction Stop
+        }
+    }
+
+    $ctx = Get-MgContext
+
+    if (-not $ctx) {
+        Stop-WithMessage "Microsoft Graph connection did not return a context."
+    }
+
+    $script:TenantId = $ctx.TenantId
+
+    if ([string]::IsNullOrWhiteSpace($script:ClientId)) {
+        $script:ClientId = $ctx.ClientId
+    }
+
+    Write-Ok "Connected to Microsoft Graph tenant $script:TenantId using $script:ConnectionModeUsed mode"
+}
+function Disconnect-GraphSession {
+    try {
+        if (Get-MgContext) {
+            Disconnect-MgGraph | Out-Null
+            Write-Host "Disconnected from Microsoft Graph." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "No active Microsoft Graph session found." -ForegroundColor DarkYellow
+        }
+    }
+    catch {
+        Write-Host "Disconnect attempt completed." -ForegroundColor Yellow
+    }
+}
+function Connect-GraphSession {
+    Initialize-GraphModules
+    Connect-EntraAuditGraph
+}
+function Test-GraphConnection {
+    if (-not (Get-MgContext)) {
+        Write-Host "Not connected to Microsoft Graph. Use option 1 first." -ForegroundColor Red
+        return $false
+    }
+
+    return $true
+}
+# ============================================================
+# SECTION 5 - PRINCIPAL RESOLUTION AND SCOPE FILTERING
+# Entra role assignments can be assigned to users, groups, or service principals.
+# These helpers resolve the assignment target and determine whether it matches the selected audit scope.
+# ============================================================
+# Principal resolver normalizes users, groups, and service principals into one output shape.
+function Resolve-EntraPrincipal {
+    param([string]$PrincipalId)
+
+    $user = Get-MgUser -UserId $PrincipalId -Property "Id,DisplayName,UserPrincipalName,Mail,AccountEnabled,UserType,Department,JobTitle" -ErrorAction SilentlyContinue
+
+    if ($user) {
+        return [pscustomobject]@{
+            Type           = "User"
+            Id             = $user.Id
+            DisplayName    = $user.DisplayName
+            UPN            = $user.UserPrincipalName
+            Mail           = $user.Mail
+            AccountEnabled = $user.AccountEnabled
+            UserType       = $user.UserType
+            Department     = $user.Department
+            JobTitle       = $user.JobTitle
+            AppId          = ""
+        }
+    }
+
+    $group = Get-MgGroup -GroupId $PrincipalId -Property "Id,DisplayName,Mail" -ErrorAction SilentlyContinue
+
+    if ($group) {
+        return [pscustomobject]@{
+            Type           = "Group"
+            Id             = $group.Id
+            DisplayName    = $group.DisplayName
+            UPN            = $group.Mail
+            Mail           = $group.Mail
+            AccountEnabled = ""
+            UserType       = "Group"
+            Department     = ""
+            JobTitle       = ""
+            AppId          = ""
+        }
+    }
+
+    $sp = Get-MgServicePrincipal -ServicePrincipalId $PrincipalId -Property "Id,DisplayName,AppId,ServicePrincipalType" -ErrorAction SilentlyContinue
+
+    if ($sp) {
+        return [pscustomobject]@{
+            Type           = "ServicePrincipal"
+            Id             = $sp.Id
+            DisplayName    = $sp.DisplayName
+            UPN            = ""
+            Mail           = ""
+            AccountEnabled = ""
+            UserType       = $sp.ServicePrincipalType
+            Department     = ""
+            JobTitle       = ""
+            AppId          = $sp.AppId
+        }
+    }
+
+    return [pscustomobject]@{
+        Type           = "Unknown"
+        Id             = $PrincipalId
+        DisplayName    = $PrincipalId
+        UPN            = ""
+        Mail           = ""
+        AccountEnabled = ""
+        UserType       = "Unknown"
+        Department     = ""
+        JobTitle       = ""
+        AppId          = ""
+    }
+}
+function Initialize-ScopeTargets {
+    if ($script:AuditScope -eq "SpecificGroup") {
+        $group = Get-MgGroup -Filter "displayName eq '$($script:TargetGroupIdOrName)'" -ConsistencyLevel eventual -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if (-not $group) {
+            $group = Get-MgGroup -GroupId $script:TargetGroupIdOrName -ErrorAction SilentlyContinue
+        }
+
+        if (-not $group) {
+            Stop-WithMessage "Unable to find target group: $($script:TargetGroupIdOrName)"
+        }
+
+        $script:TargetGroupId = $group.Id
+        $script:TargetGroupName = $group.DisplayName
+
+        Write-Ok "Target group resolved: $script:TargetGroupName"
+    }
+
+    if ($script:AuditScope -eq "OneUser") {
+        $user = Get-MgUser -UserId $script:TargetUserIdOrUpn -Property "Id,DisplayName,UserPrincipalName" -ErrorAction SilentlyContinue
+
+        if (-not $user) {
+            Stop-WithMessage "Unable to find target user: $($script:TargetUserIdOrUpn)"
+        }
+
+        $script:TargetUserId = $user.Id
+        $script:TargetUserUpn = $user.UserPrincipalName
+
+        Write-Ok "Target user resolved: $($user.DisplayName) [$script:TargetUserUpn]"
+    }
+}
+function Test-AuditScopeMatch {
+    param([object]$Principal)
+
+    switch ($script:AuditScope) {
+        "WholeTenant" {
+            return $true
+        }
+
+        "SpecificGroup" {
+            return ($Principal.Id -eq $script:TargetGroupId -or $Principal.Type -eq "User")
+        }
+
+        "EnabledUsers" {
+            return ($Principal.Type -eq "User" -and $Principal.AccountEnabled -eq $true)
+        }
+
+        "OneUser" {
+            return ($Principal.Id -eq $script:TargetUserId)
+        }
+
+        "ServicePrincipals" {
+            return ($Principal.Type -eq "ServicePrincipal")
+        }
+
+        default {
+            return $true
+        }
+    }
+}
+# ============================================================
+# SECTION 6 - ACTIVE ROLE ASSIGNMENT AUDIT
+# This section reads currently active Entra directory role assignments.
+# Role-assigned groups can optionally be expanded to show effective user membership.
+# ============================================================
+# Active role audit: get enabled directory roles, filter to the requested role list, resolve assigned principals, and optionally expand role-assigned groups.
+function Get-EntraActiveRoleAssignments {
+    Write-Section "Entra active directory role assignments"
+
+    $rows = @()
+    $roles = @(Get-MgDirectoryRole -All -ErrorAction Stop)
+
+    if (-not $script:AllRoles) {
+        $roles = @($roles | Where-Object { $_.DisplayName -in $script:RoleNames })
+    }
+
+    Write-Ok "Roles selected for audit: $($roles.Count)"
+
+    for ($roleIndex = 0; $roleIndex -lt $roles.Count; $roleIndex++) {
+        $role = $roles[$roleIndex]
+
+        Show-Progress -Activity "Auditing active Entra role assignments" -Status "Role $($roleIndex + 1) of $($roles.Count): $($role.DisplayName)" -Current ($roleIndex + 1) -Total $roles.Count
+        Write-Step "Role: $($role.DisplayName)"
+
+        $members = @(Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All -ErrorAction SilentlyContinue)
+
+        foreach ($member in $members) {
+            $principal = Resolve-EntraPrincipal -PrincipalId $member.Id
+
+            if ($script:AuditScope -eq "SpecificGroup" -and $principal.Id -eq $script:TargetGroupId) {
+                $rows += New-AuditRow -RoleName $role.DisplayName -RoleId $role.Id -AssignmentType "Active Group Assignment" -Principal $principal -Schedule (New-EmptySchedule)
+            }
+            elseif (Test-AuditScopeMatch -Principal $principal) {
+                $rows += New-AuditRow -RoleName $role.DisplayName -RoleId $role.Id -AssignmentType "Active" -Principal $principal -Schedule (New-EmptySchedule)
+            }
+
+            if (($IncludeGroupMembers -or $script:AuditScope -eq "SpecificGroup") -and $principal.Type -eq "Group") {
+                if ($script:AuditScope -eq "SpecificGroup" -and $principal.Id -ne $script:TargetGroupId) {
+                    continue
+                }
+
+                $groupMembers = @(Get-MgGroupMember -GroupId $principal.Id -All -ErrorAction SilentlyContinue)
+
+                foreach ($groupMember in $groupMembers) {
+                    $groupPrincipal = Resolve-EntraPrincipal -PrincipalId $groupMember.Id
+
+                    if (Test-AuditScopeMatch -Principal $groupPrincipal) {
+                        $rows += New-AuditRow -RoleName $role.DisplayName -RoleId $role.Id -AssignmentType "Active via Group" -Principal $groupPrincipal -SourceGroup $principal.DisplayName -Schedule (New-EmptySchedule)
+                    }
+                }
+            }
+        }
+    }
+
+    Write-Progress -Activity "Auditing active Entra role assignments" -Completed
+    return $rows
+}
+# ============================================================
+# SECTION 7 - OPTIONAL PIM ELIGIBILITY AUDIT
+# This section only runs when Include PIM is enabled from the menu or parameter.
+# PIM eligible assignments are exported separately from active assignments using RecordType.
+# ============================================================
+# PIM audit: when enabled, query eligible role schedules and map each schedule back to a role definition and principal.
+function Get-EntraPimEligibleAssignments {
+    Write-Section "Entra PIM eligible role assignments"
+
+    $rows = @()
+
+    if (-not ($script:IncludePIM -or $IncludePIM)) {
+        Write-Warn2 "PIM eligibility skipped."
+        return $rows
+    }
+
+    $eligibleAssignments = @(Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop)
+    Write-Ok "Eligibility schedules found: $($eligibleAssignments.Count)"
+
+    for ($index = 0; $index -lt $eligibleAssignments.Count; $index++) {
+        $item = $eligibleAssignments[$index]
+
+        Show-Progress -Activity "Auditing PIM eligible assignments" -Status "Eligibility schedule $($index + 1) of $($eligibleAssignments.Count)" -Current ($index + 1) -Total $eligibleAssignments.Count
+
+        $roleDefinition = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $item.RoleDefinitionId -ErrorAction SilentlyContinue
+
+        if (-not $roleDefinition) {
+            continue
+        }
+
+        if (-not $script:AllRoles -and $roleDefinition.DisplayName -notin $script:RoleNames) {
+            continue
+        }
+
+        $principal = Resolve-EntraPrincipal -PrincipalId $item.PrincipalId
+
+        if (Test-AuditScopeMatch -Principal $principal) {
+            $rows += New-AuditRow -RoleName $roleDefinition.DisplayName -RoleId $item.RoleDefinitionId -AssignmentType "PIM Eligible" -Principal $principal -Schedule (New-PimSchedule -Item $item)
+        }
+    }
+
+    Write-Progress -Activity "Auditing PIM eligible assignments" -Completed
+    return $rows
+}
+# ============================================================
+# SECTION 8 - EXPORT AND RUNTIME CONFIGURATION
+# Export writes one CSV only. The first row is a summary row, followed by active and optional PIM rows.
+# Runtime configuration functions update script-scoped values used by the menus and audit engine.
+# ============================================================
+# Final export combines summary and audit rows into a single CSV file.
+function Export-SingleAuditCsv { param([object[]]$ActiveRows,[object[]]$PimRows) Write-Progress -Activity "Exporting audit results" -Status "Preparing summary row" -PercentComplete 20; $summary = @([pscustomobject]@{RoleName="";RoleId="";AssignmentType="Summary";PrincipalType="";DisplayName="";UserPrincipalName="";Mail="";AccountEnabled="";UserType="";Department="";JobTitle="";PrincipalId="";AppId="";SourceGroup="";ScheduleStart="";ScheduleEnd="";ExpirationType="";Status="";TenantId=$script:TenantId;ConnectionMode=$script:ConnectionModeUsed;ClientId=$script:ClientId;AllRoles=$script:AllRoles;IncludedPIM=($script:IncludePIM -or $IncludePIM);IncludedGroupMembers=$IncludeGroupMembers.IsPresent;ActiveAssignmentRows=@($ActiveRows).Count;PimEligibleRows=@($PimRows).Count;OutputFilePath=$script:OutputFilePath;AuditScope=$script:AuditScope;RolePreset=$script:RolePreset;TargetGroup=$script:TargetGroupName;TargetUser=$script:TargetUserUpn;ExportedAt=(Get-Date -Format "yyyy-MM-dd HH:mm:ss")}); Write-Progress -Activity "Exporting audit results" -Status "Combining rows" -PercentComplete 60; $combined = @(); $combined += Add-RecordType -Data $summary -RecordType "Summary"; $combined += Add-RecordType -Data $ActiveRows -RecordType "ActiveRoleAssignment"; $combined += Add-RecordType -Data $PimRows -RecordType "PIMEligibleAssignment"; Write-Progress -Activity "Exporting audit results" -Status "Writing CSV" -PercentComplete 90; $combined | Export-Csv -Path $script:OutputFilePath -NoTypeInformation -Encoding UTF8; Write-Progress -Activity "Exporting audit results" -Completed; Write-Ok "Single CSV exported with $(@($combined).Count) rows"; Write-Host ""; Write-Host "CSV created:" -ForegroundColor Cyan; Write-Host "  $script:OutputFilePath" }
+function Set-OutputFolder {
+    if (-not (Test-Path $script:OutputPath)) {
+        New-Item -ItemType Directory -Path $script:OutputPath -Force | Out-Null
+    }
+
+    $script:OutputFilePath = Join-Path $script:OutputPath $OutputFileName
+
+    if (Test-Path $script:OutputFilePath) {
+        Remove-Item $script:OutputFilePath -Force
+    }
+
+    Write-Ok "Output CSV set to $script:OutputFilePath"
+}
+function Show-CurrentConfiguration {
+    Write-Host ""
+    Write-Host "Current configuration:" -ForegroundColor Cyan
+    Write-Host "  Audit scope: $script:AuditScope" -ForegroundColor DarkCyan
+
+    if ($script:TargetUserIdOrUpn) {
+        Write-Host "  Target user: $script:TargetUserIdOrUpn" -ForegroundColor DarkCyan
+    }
+
+    if ($script:TargetGroupIdOrName) {
+        Write-Host "  Target group: $script:TargetGroupIdOrName" -ForegroundColor DarkCyan
+    }
+
+    Write-Host "  Role filter: $script:RolePreset" -ForegroundColor DarkCyan
+    Write-Host "  Include PIM eligible assignments: $script:IncludePIM" -ForegroundColor DarkCyan
+    Write-Host "  Expand role-assigned groups: $script:IncludeGroupMembers" -ForegroundColor DarkCyan
+    Write-Host "  Output CSV: $script:OutputFilePath" -ForegroundColor DarkCyan
+}
+function Reset-AuditDefaults {
+    $script:OutputPath = $OutputPath
+    $script:OutputFilePath = Join-Path $script:OutputPath $OutputFileName
+    $script:IncludePIM = $false
+    $script:IncludeGroupMembers = $false
+    $script:AuditScope = "WholeTenant"
+    $script:TargetUserIdOrUpn = ""
+    $script:TargetUserId = ""
+    $script:TargetUserUpn = ""
+    $script:TargetGroupIdOrName = ""
+    $script:TargetGroupId = ""
+    $script:TargetGroupName = ""
+    $script:RolePreset = "Privileged"
+    $script:RoleNames = Get-RoleNamesForPreset -Preset $script:RolePreset
+    $script:AllRoles = $false
+
+    Write-Ok "Audit settings reset to defaults."
+}
+function Confirm-RunReport {
+    Show-CurrentConfiguration
+
+    if ($script:AuditScope -eq "WholeTenant" -or $script:RolePreset -eq "All") {
+        Write-Host ""
+        Write-Host "Large report warning: current settings may return a large number of rows." -ForegroundColor Yellow
+    }
+
+    return (Read-YesNo -Prompt "Run report with the current configuration" -Default $false)
+}
+function Configure-OutputFolder {
+    Write-Host ""
+    Write-Host "Current output folder: $script:OutputPath" -ForegroundColor Cyan
+
+    $newPath = Read-Host "Enter new output folder or press Enter to keep current"
+
+    if (-not [string]::IsNullOrWhiteSpace($newPath)) {
+        $script:OutputPath = $newPath
+    }
+
+    Set-OutputFolder
+}
+function Configure-RolePreset {
+    $selected = Select-RolePreset
+
+    if ([string]::IsNullOrWhiteSpace($selected)) {
+        return
+    }
+
+    $script:RolePreset = $selected
+    $script:RoleNames = Get-RoleNamesForPreset -Preset $selected
+    $script:AllRoles = ($selected -eq "All")
+
+    Write-Ok "Role preset set to $script:RolePreset"
+}
+function Toggle-PimAudit {
+    $script:IncludePIM = -not [bool]($script:IncludePIM -or $IncludePIM)
+    Write-Ok "Include PIM eligible assignments: $script:IncludePIM"
+}
+function Run-RoleAudit {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Scope
+    )
+
+    if (-not (Test-GraphConnection)) {
+        return
+    }
+
+    if (-not (Confirm-RunReport)) {
+        Write-Warn2 "Report run canceled by operator."
+        return
+    }
+
+    $script:AuditScope = $Scope
+
+    Set-OutputFolder
+    Initialize-ScopeTargets
+
+    $activeRows = Get-EntraActiveRoleAssignments
+    $pimRows = Get-EntraPimEligibleAssignments
+
+    Export-SingleAuditCsv -ActiveRows $activeRows -PimRows $pimRows
+}
+# ============================================================
+# SECTION 9 - INTERACTIVE MENUS
+# Menus are intentionally one-selection-at-a-time. After each submenu choice, control returns to the main menu.
+# This avoids nested looping confusion and makes current settings visible before each action.
+# ============================================================
+function Show-ScopeOfAuditMenu {
+    Write-Host ""
+    Write-Host "===== CONFIGURE AUDIT SCOPE =====" -ForegroundColor Cyan
+    Write-Host "1. All role assignments"
+    Write-Host "2. Enabled user assignments only"
+    Write-Host "3. One specific user"
+    Write-Host "4. One specific group"
+    Write-Host "5. Service principal assignments only"
+    Write-Host "B. Back"
+    Write-Host ""
+    Write-Host "Current audit scope: $script:AuditScope" -ForegroundColor DarkCyan
+
+    if ($script:TargetUserIdOrUpn) {
+        Write-Host "Target user: $script:TargetUserIdOrUpn" -ForegroundColor DarkCyan
+    }
+
+    if ($script:TargetGroupIdOrName) {
+        Write-Host "Target group: $script:TargetGroupIdOrName" -ForegroundColor DarkCyan
+    }
+
+    $choice = Read-Host "Select an option"
+
+    switch ($choice.ToUpper()) {
+        "1" {
+            $script:AuditScope = "WholeTenant"
+            $script:TargetUserIdOrUpn = ""
+            $script:TargetGroupIdOrName = ""
+            Write-Ok "Audit scope set to all role assignments"
+            return
+        }
+
+        "2" {
+            $script:AuditScope = "EnabledUsers"
+            $script:TargetUserIdOrUpn = ""
+            $script:TargetGroupIdOrName = ""
+            Write-Ok "Audit scope set to enabled user assignments only"
+            return
+        }
+
+        "3" {
+            $targetUser = Read-Host "Enter user UPN or object ID"
+            if (-not [string]::IsNullOrWhiteSpace($targetUser)) {
+                $script:AuditScope = "OneUser"
+                $script:TargetUserIdOrUpn = $targetUser
+                $script:TargetGroupIdOrName = ""
+                Write-Ok "Audit scope set to one specific user"
+            }
+            return
+        }
+
+        "4" {
+            $targetGroup = Read-Host "Enter group display name or object ID"
+            if (-not [string]::IsNullOrWhiteSpace($targetGroup)) {
+                $script:AuditScope = "SpecificGroup"
+                $script:TargetGroupIdOrName = $targetGroup
+                $script:TargetUserIdOrUpn = ""
+                Write-Ok "Audit scope set to one specific group"
+            }
+            return
+        }
+
+        "5" {
+            $script:AuditScope = "ServicePrincipals"
+            $script:TargetUserIdOrUpn = ""
+            $script:TargetGroupIdOrName = ""
+            Write-Ok "Audit scope set to service principal assignments only"
+            return
+        }
+
+        "B" { return }
+
+        default {
+            Write-Host "Invalid selection." -ForegroundColor Red
+            return
+        }
+    }
+}
+function Show-RoleAuditOptionsMenu {
+    Write-Host ""
+    Write-Host "===== CONFIGURE ROLE FILTERS AND OPTIONS =====" -ForegroundColor Cyan
+    Write-Host "1. Select role preset"
+    Write-Host "2. Include or exclude PIM eligible assignments"
+    Write-Host "3. Expand role-assigned groups"
+    Write-Host "   When enabled, role-assigned groups are expanded so the report also shows the users inside those groups." -ForegroundColor DarkGray
+    Write-Host "   This helps identify effective users but can increase report size and runtime for large groups." -ForegroundColor DarkGray
+    Write-Host "B. Back"
+    Write-Host ""
+    Write-Host "Current audit scope: $script:AuditScope" -ForegroundColor DarkCyan
+    Write-Host "Current role filter: $script:RolePreset" -ForegroundColor DarkCyan
+    Write-Host "Include PIM eligible assignments: $script:IncludePIM" -ForegroundColor DarkCyan
+    Write-Host "Expand role-assigned groups: $script:IncludeGroupMembers" -ForegroundColor DarkCyan
+
+    $choice = Read-Host "Select an option"
+
+    switch ($choice.ToUpper()) {
+        "1" {
+            Configure-RolePreset
+            return
+        }
+
+        "2" {
+            Toggle-PimAudit
+            return
+        }
+
+        "3" {
+            $script:IncludeGroupMembers = -not [bool]$script:IncludeGroupMembers
+
+            if ($script:IncludeGroupMembers) {
+                Write-Ok "Group expansion enabled. The report will include users found inside role-assigned groups."
+            }
+            else {
+                Write-Ok "Group expansion disabled. The report will show the group assignment only, not group members."
+            }
+
+            return
+        }
+
+        "B" { return }
+
+        default {
+            Write-Host "Invalid selection." -ForegroundColor Red
+            return
+        }
+    }
+}
+function Initialize-MenuDefaults {
+    # Initialize values shown in the main menu before the operator makes any selections.
+    $script:OutputPath = $OutputPath
+    $script:OutputFilePath = Join-Path $script:OutputPath $OutputFileName
+    $script:TenantId = ""
+    $script:ClientId = ""
+    $script:ConnectionModeUsed = "Not connected"
+    $script:IncludePIM = $IncludePIM.IsPresent
+    $script:IncludeGroupMembers = $IncludeGroupMembers.IsPresent
+    $script:AuditScope = "WholeTenant"
+    $script:TargetUserIdOrUpn = ""
+    $script:TargetUserId = ""
+    $script:TargetUserUpn = ""
+    $script:TargetGroupIdOrName = ""
+    $script:TargetGroupId = ""
+    $script:TargetGroupName = ""
+    $script:RolePreset = "Privileged"
+    $script:RoleNames = Get-RoleNamesForPreset -Preset $script:RolePreset
+    $script:AllRoles = $AllRoles.IsPresent
+
+    Write-Section "Microsoft Entra Role Audit"
+    Write-Host "Script loaded. Configure the audit scope, role filters, and output location, then choose Run Report." -ForegroundColor White
+    Write-Host "Default audit scope: All role assignments. Default role filter: Privileged roles." -ForegroundColor White
+}
+# Main menu: the script loads into an operator menu and only runs an audit after a menu selection.
+Initialize-MenuDefaults
+:mainLoop while ($true) {
+    Write-Host ""
+    Write-Host "===== MAIN MENU =====" -ForegroundColor Cyan
+    Write-Host "1. Connect / Reconnect to Microsoft Graph"
+    Write-Host "2. Configure Audit Scope"
+    Write-Host "3. Configure Role Filters and Options"
+    Write-Host "4. Configure Output Location"
+    Write-Host "5. Run Report"
+    Write-Host "6. Show Current Configuration"
+    Write-Host "7. Reset to Defaults"
+    Write-Host "Q. Quit"
+
+    Show-CurrentConfiguration
+
+    $choice = Read-Host "Select an option"
+
+    switch ($choice.ToUpper()) {
+        "1" {
+            Connect-GraphSession
+        }
+
+        "2" {
+            Show-ScopeOfAuditMenu
+        }
+
+        "3" {
+            Show-RoleAuditOptionsMenu
+        }
+
+        "4" {
+            Configure-OutputFolder
+        }
+
+        "5" {
+            Run-RoleAudit -Scope $script:AuditScope
+        }
+
+        "6" {
+            Show-CurrentConfiguration
+        }
+
+        "7" {
+            Reset-AuditDefaults
+        }
+
+        "Q" {
+            Disconnect-GraphSession
+            Write-Host "Exiting..." -ForegroundColor Yellow
+            break mainLoop
+        }
+
+        default {
+            Write-Host "Invalid selection." -ForegroundColor Red
+        }
+    }
+}
+
