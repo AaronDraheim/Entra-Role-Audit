@@ -10,7 +10,7 @@ loss of business information, or other pecuniary loss) arising out of the use of
 documentation, even if Microsoft has been advised of the possibility of such damages.
 #>
 # Simplified-EntraRoleAudit.ps1
-# Version: 1.0
+# Version: 4.0
 # Purpose: Audit Microsoft Entra directory role assignments using Microsoft Graph PowerShell.
 # Output: One CSV file containing summary, active role assignments, and optional PIM eligibility rows.
 # Supports interactive delegated sign-in, device code sign-in, or app-only certificate authentication.
